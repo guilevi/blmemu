@@ -128,6 +128,8 @@ You need CMake, a C/C++ compiler, and `git submodule update --init` (librc8650 i
     cmake --build build
 
 - **Windows** from macOS or Linux with mingw-w64: `cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake`.
+- **On Windows itself** with [w64devkit](https://github.com/skeeto/w64devkit) (its `bin` on the PATH, with Git and
+  CMake): `sh tools/prepare_m32c.sh`, then `cmake -B build -G "MinGW Makefiles"` and `cmake --build build`.
 - **Linux** needs `libasound2-dev`.
 - **A release:** `tools/package.sh macos|linux|windows BUILD_DIR`.
 - **CI:** `.github/workflows/build.yml` builds all three.

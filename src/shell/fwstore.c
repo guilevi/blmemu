@@ -92,6 +92,11 @@ static void make_dirs(const char *path)            /* every folder along it */
 int fw_home(char *out, size_t cap)
 {
     const char *o = getenv("BLMEMU_HOME"), *base;
+#if defined(_WIN32)
+    char ou[FW_PATH_MAX];                        /* in UTF-8 too, as every path here is, whatever the code page */
+    const wchar_t *ow = _wgetenv(L"BLMEMU_HOME");
+    o = ow && *ow && WideCharToMultiByte(CP_UTF8, 0, ow, -1, ou, (int)sizeof ou, NULL, NULL) ? ou : NULL;
+#endif
     if (o && *o) snprintf(out, cap, "%s", o);
     else {
 #if defined(_WIN32)

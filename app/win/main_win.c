@@ -13,6 +13,7 @@
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@ enum {
 
 static HWND g_wnd, g_field;
 static ULONGLONG g_silent_at;
+static int g_no_sound, g_braille_now;          /* the command line's --no-sound and --braille */
 static WNDPROC g_field_proc;
 static blm_session *g_s;
 static settings *g_ini;
@@ -174,12 +176,12 @@ static void render(void *ctx, int16_t *out, size_t n, unsigned rate)
    unheard: its keys, its braille display and its files work as before. */
 static void start_sound(void)
 {
-    char err[512];
+    char err[512] = "";
     KillTimer(g_wnd, TIMER_SILENT);
-    if (wa_start(render, NULL, err, sizeof err) == 0) return;
+    if (!g_no_sound && wa_start(render, NULL, err, sizeof err) == 0) return;
     g_silent_at = GetTickCount64();
     SetTimer(g_wnd, TIMER_SILENT, 10, NULL);
-    msg(err, MB_ICONWARNING);
+    if (err[0]) msg(err, MB_ICONWARNING);
 }
 
 static void stop_sound(void)
@@ -277,13 +279,18 @@ static void show_cells(int force)
     g_n_shown = n;
 }
 
-static void set_braille(int on)
+static void show_braille(int on)
 {
     g_braille = on;
     CheckMenuItem(GetMenu(g_wnd), ID_BRAILLE, on ? MF_CHECKED : MF_UNCHECKED);
     ShowWindow(g_field, on ? SW_SHOW : SW_HIDE);
     SetFocus(on ? g_field : g_wnd);
     show_cells(1);
+}
+
+static void set_braille(int on)                /* the menu's: shown or hidden, and kept for the next start */
+{
+    show_braille(on);
     settings_set_int(g_ini, "display", "braille", on);
     settings_save(g_ini);
 }
@@ -427,6 +434,48 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
+/* ---- the command line ---------------------------------------------------------------------------------------------- */
+/* The terminal program's options, as far as a window has them: a window has no terminal to print to, so what it has
+   to say comes in a message box.  0 to go on, else the exit code + 1. */
+static int command_line(void)
+{
+    static const char usage[] =
+        "blmemu [--no-sound] [--braille] [--home DIR] [--import-firmware PATH] [--import-doubletalk PATH]\n\n"
+        "--no-sound\trun silent\n"
+        "--braille\tshow the braille display from the start\n"
+        "--home DIR\tkeep the firmware, memory and settings in DIR\n"
+        "--import-firmware PATH\tbring in BLM40ENU.BNS without asking\n"
+        "--import-doubletalk PATH\tbring in RC Studio's folder or an RC8650 .srec without asking\n"
+        "--version";
+    const wchar_t *imp[2] = {NULL, NULL};
+    char path[FW_PATH_MAX], what[256], err[512], m[FW_PATH_MAX + 600];
+    int argc = 0, i, r = 0;
+    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 0;
+    for (i = 1; i < argc && !r; i++) {
+        const wchar_t *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+        if (!wcscmp(a, L"--no-sound")) g_no_sound = 1;
+        else if (!wcscmp(a, L"--braille")) g_braille_now = 1;
+        else if (!wcscmp(a, L"--home") && v) { _wputenv_s(L"BLMEMU_HOME", v); i++; }
+        else if (!wcscmp(a, L"--import-firmware") && v) imp[0] = argv[++i];
+        else if (!wcscmp(a, L"--import-doubletalk") && v) imp[1] = argv[++i];
+        else if (!wcscmp(a, L"--version")) { msg("blmemu " BLMEMU_VERSION, MB_ICONINFORMATION); r = 1; }
+        else if (!wcscmp(a, L"--help")) { msg(usage, MB_ICONINFORMATION); r = 1; }
+        else { msg(usage, MB_ICONWARNING); r = 3; }
+    }
+    for (i = 0; i < 2 && !r; i++) {            /* after --home, wherever it stood: they go into that folder */
+        if (!imp[i]) continue;
+        WideCharToMultiByte(CP_UTF8, 0, imp[i], -1, path, (int)sizeof path, NULL, NULL);
+        if ((i ? fw_import_rc8650 : fw_import_bns)(path, what, sizeof what, err, sizeof err)) {
+            snprintf(m, sizeof m, "%s cannot be used: %s.", path, err);
+            msg(m, MB_ICONWARNING);
+            r = 2;
+        }
+    }
+    LocalFree(argv);
+    return r;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
     WNDCLASSW wc;
@@ -434,8 +483,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     HACCEL hacc;
     MSG mm;
     char err[512], m[700];
+    int r;
     (void)prev; (void)cmd;
     SetProcessDPIAware();
+    if ((r = command_line()) != 0) return r - 1;
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
@@ -465,7 +516,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     session_display_mode(g_s, settings_int(g_ini, "unit", "display_mode", 0));
     CheckMenuItem(GetMenu(g_wnd), ID_DISPLAYMODE, session_display_mode_on(g_s) ? MF_CHECKED : MF_UNCHECKED);
     start_sound();
-    if (settings_int(g_ini, "display", "braille", 0)) set_braille(1);
+    if (g_braille_now || settings_int(g_ini, "display", "braille", 0)) show_braille(1);
     SetTimer(g_wnd, TIMER_POLL, 50, NULL);
 
     hacc = CreateAcceleratorTableW(acc, 2);

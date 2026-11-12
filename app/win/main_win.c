@@ -35,8 +35,10 @@ enum {
 #define WM_NOTE (WM_APP + 1)
 #define TIMER_POLL 1
 #define TIMER_RELEASE 2
+#define TIMER_SILENT 3
 
 static HWND g_wnd, g_field;
+static ULONGLONG g_silent_at;
 static WNDPROC g_field_proc;
 static blm_session *g_s;
 static settings *g_ini;
@@ -168,6 +170,32 @@ static void render(void *ctx, int16_t *out, size_t n, unsigned rate)
     session_render(g_s, out, n, rate);
 }
 
+/* The sound thread runs the unit as it renders.  With no sound device to open, a timer runs it by the clock instead,
+   unheard: its keys, its braille display and its files work as before. */
+static void start_sound(void)
+{
+    char err[512];
+    KillTimer(g_wnd, TIMER_SILENT);
+    if (wa_start(render, NULL, err, sizeof err) == 0) return;
+    g_silent_at = GetTickCount64();
+    SetTimer(g_wnd, TIMER_SILENT, 10, NULL);
+    msg(err, MB_ICONWARNING);
+}
+
+static void stop_sound(void)
+{
+    KillTimer(g_wnd, TIMER_SILENT);
+    wa_stop();
+}
+
+static void run_silent(void)                   /* the timer's: the time gone by since its last tick */
+{
+    ULONGLONG now = GetTickCount64();
+    double s = (double)(now - g_silent_at) / 1000.0;
+    g_silent_at = now;
+    session_run_silent(g_s, s > 0.1 ? 0.1 : s);  /* a stalled window (a menu, a dialog) is not caught up on */
+}
+
 /* ---- keys --------------------------------------------------------------------------------------------------------- */
 static int key_dot(WPARAM vk)
 {
@@ -285,7 +313,7 @@ static HMENU make_menu(void)
 static void reopen(void)                       /* new firmware: the unit switched off, saved, and started on it */
 {
     char err[512], m[700];
-    wa_stop();
+    stop_sound();
     session_close(g_s);
     g_s = session_open(note, NULL, err, sizeof err);
     if (!g_s) {
@@ -295,7 +323,7 @@ static void reopen(void)                       /* new firmware: the unit switche
         return;
     }
     session_display_mode(g_s, settings_int(g_ini, "unit", "display_mode", 0));
-    wa_start(render, NULL, err, sizeof err);
+    start_sound();
     SetWindowTextW(g_wnd, TITLE);
 }
 
@@ -347,13 +375,17 @@ static void command(int id)
             "Alt+Shift+B shows the braille display in the window. Ctrl+R restarts the unit. Alt opens the menu.",
             MB_ICONINFORMATION);
         break;
-    case ID_ABOUT:
+    case ID_ABOUT: {
+        char sound[64];
+        if (wa_rate()) snprintf(sound, sizeof sound, "Sound at %u Hz.", wa_rate());
+        else snprintf(sound, sizeof sound, "No sound: the unit runs silent.");
         snprintf(m, sizeof m, "Braille Lite Millennium emulator %s\n\nFreedom Scientific's firmware on an emulated Z180 "
                  "(MAME's core, BSD-3-Clause); its DoubleTalk on librc8650, RC Systems' firmware on an emulated M16C "
-                 "(GPL-3). This program: GPL-3.\n\nSound at %u Hz.\nData folder: %s", BLMEMU_VERSION, wa_rate(),
+                 "(GPL-3). This program: GPL-3.\n\n%s\nData folder: %s", BLMEMU_VERSION, sound,
                  fw_home(home, sizeof home) == 0 ? home : "?");
         msg(m, MB_ICONINFORMATION);
         break;
+    }
     }
 }
 
@@ -376,6 +408,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     case WM_TIMER:
         if (w == TIMER_POLL) show_cells(0);
+        if (w == TIMER_SILENT) run_silent();
         if (w == TIMER_RELEASE) {              /* the hard reset's I-chord comes up */
             KillTimer(h, TIMER_RELEASE);
             session_keys(g_s, g_dots, g_space);
@@ -431,7 +464,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_ini = settings_load();
     session_display_mode(g_s, settings_int(g_ini, "unit", "display_mode", 0));
     CheckMenuItem(GetMenu(g_wnd), ID_DISPLAYMODE, session_display_mode_on(g_s) ? MF_CHECKED : MF_UNCHECKED);
-    if (wa_start(render, NULL, err, sizeof err)) msg(err, MB_ICONWARNING);
+    start_sound();
     if (settings_int(g_ini, "display", "braille", 0)) set_braille(1);
     SetTimer(g_wnd, TIMER_POLL, 50, NULL);
 
@@ -441,7 +474,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         TranslateMessage(&mm);
         DispatchMessageW(&mm);
     }
-    wa_stop();
+    stop_sound();
     session_close(g_s);
     settings_free(g_ini);
     return 0;

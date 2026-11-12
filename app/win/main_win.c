@@ -23,6 +23,7 @@
 #include "fwstore.h"
 #include "session.h"
 #include "settings.h"
+#include "u8file.h"
 
 #ifndef BLMEMU_VERSION
 #define BLMEMU_VERSION "dev"
@@ -149,12 +150,12 @@ static int first_start(void)
 {
     char p[FW_PATH_MAX];
     FILE *f;
-    if (fw_path(FW_BNS_NAME, p, sizeof p) || !(f = fopen(p, "rb"))) {
+    if (fw_path(FW_BNS_NAME, p, sizeof p) || !(f = u8_fopen(p, "rb"))) {   /* the path is UTF-8: not fopen's */
         msg("This emulator runs the Millennium's own firmware, which does not come with it. Choose the Millennium 40 "
             "update file, BLM40ENU.BNS (from Freedom Scientific's update disk).", MB_ICONINFORMATION);
         if (bring_in_bns()) return -1;
     } else fclose(f);
-    if (fw_path(FW_RC_NAME, p, sizeof p) || !(f = fopen(p, "rb"))) {
+    if (fw_path(FW_RC_NAME, p, sizeof p) || !(f = u8_fopen(p, "rb"))) {
         if (bring_in_installed_rc()) {
             msg("The unit's speech is a DoubleTalk, whose firmware comes with RC Studio, RC Systems' free development "
                 "software. Install RC Studio, or choose its firmware file: m$4a95b2.bin in RC Studio's Bin folder "

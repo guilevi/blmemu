@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos, os: macos-14 }
+          - { name: macos, os: macos-latest }
           - { name: linux, os: ubuntu-22.04 }
           - { name: windows, os: ubuntu-22.04 }
     runs-on: ${{ matrix.os }}

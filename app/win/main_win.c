@@ -15,7 +15,9 @@
 #include <commdlg.h>
 #include <shlobj.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include "audio_wasapi.h"
 #include "fwstore.h"
 #include "session.h"
@@ -88,14 +90,46 @@ static int bring_in_bns(void)
     }
 }
 
-static int bring_in_rc(int quiet)
+/* RC Studio installed: its firmware, without asking.  Its folder is the one its installer wrote down (the uninstall
+   entry's InstallLocation; version 2.4.9 goes to Program Files (x86)\RC Systems\RCStudio), else that default under
+   each Program Files, and the older folder without "RC Systems".  0 when the firmware was brought in. */
+static int bring_in_installed_rc(void)
+{
+    static const wchar_t *const roots[] = {L"ProgramFiles(x86)", L"ProgramFiles", L"ProgramW6432"};
+    static const wchar_t *const under[] = {L"RC Systems\\RCStudio", L"RCStudio"};
+    static const REGSAM views[] = {KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+    static const HKEY hives[] = {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER};
+    wchar_t w[MAX_PATH];
+    char path[FW_PATH_MAX], what[256], err[512];
+    int i, k;
+    for (i = 0; i < 2; i++)
+        for (k = 0; k < 2; k++) {
+            HKEY key;
+            DWORD n = sizeof w - sizeof *w, type = 0;
+            if (RegOpenKeyExW(hives[i], L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RCStudio_is1", 0,
+                              KEY_QUERY_VALUE | views[k], &key) != ERROR_SUCCESS)
+                continue;
+            if (RegQueryValueExW(key, L"InstallLocation", NULL, &type, (BYTE *)w, &n) == ERROR_SUCCESS && type == REG_SZ) {
+                w[n / sizeof *w] = 0;
+                WideCharToMultiByte(CP_UTF8, 0, w, -1, path, (int)sizeof path, NULL, NULL);
+                if (fw_import_rc8650(path, what, sizeof what, err, sizeof err) == 0) { RegCloseKey(key); return 0; }
+            }
+            RegCloseKey(key);
+        }
+    for (i = 0; i < 3; i++)
+        for (k = 0; k < 2; k++) {
+            const wchar_t *root = _wgetenv(roots[i]);
+            if (!root || _snwprintf(w, MAX_PATH, L"%ls\\%ls", root, under[k]) < 0) continue;
+            w[MAX_PATH - 1] = 0;
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, path, (int)sizeof path, NULL, NULL);
+            if (fw_import_rc8650(path, what, sizeof what, err, sizeof err) == 0) return 0;
+        }
+    return -1;
+}
+
+static int bring_in_rc(void)
 {
     char path[FW_PATH_MAX], what[256], err[512], m[900];
-    const char *const found[] = {"C:\\Program Files (x86)\\RCStudio", "C:\\Program Files\\RCStudio", NULL};
-    int i;
-    if (quiet)                                 /* RC Studio installed: its firmware, without asking */
-        for (i = 0; found[i]; i++)
-            if (fw_import_rc8650(found[i], what, sizeof what, err, sizeof err) == 0) return 0;
     for (;;) {
         if (pick_file(L"The DoubleTalk's firmware: RC Studio's m$4a95b2.bin (in its Bin folder), or an RC8650 .srec",
                       L"RC Studio firmware or RC8650 image (*.bin;*.srec)\0*.bin;*.srec\0All files\0*.*\0", path,
@@ -117,13 +151,11 @@ static int first_start(void)
         if (bring_in_bns()) return -1;
     } else fclose(f);
     if (fw_path(FW_RC_NAME, p, sizeof p) || !(f = fopen(p, "rb"))) {
-        char what[256], err[512];
-        if (fw_import_rc8650("C:\\Program Files (x86)\\RCStudio", what, sizeof what, err, sizeof err) &&
-            fw_import_rc8650("C:\\Program Files\\RCStudio", what, sizeof what, err, sizeof err)) {
+        if (bring_in_installed_rc()) {
             msg("The unit's speech is a DoubleTalk, whose firmware comes with RC Studio, RC Systems' free development "
                 "software. Install RC Studio, or choose its firmware file: m$4a95b2.bin in RC Studio's Bin folder "
                 "(or an RC8650 .srec image).", MB_ICONINFORMATION);
-            if (bring_in_rc(0)) return -1;
+            if (bring_in_rc()) return -1;
         }
     } else fclose(f);
     return 0;
@@ -292,7 +324,7 @@ static void command(int id)
         if (bring_in_bns() == 0) reopen();
         break;
     case ID_RC:
-        if (bring_in_rc(0) == 0) reopen();
+        if (bring_in_rc() == 0) reopen();
         break;
     case ID_EXIT:
         DestroyWindow(g_wnd);

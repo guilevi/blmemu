@@ -70,7 +70,7 @@ target_link_libraries(blm_run blmcore ${STATIC_RUNTIME})
 # ---- the program a person runs -------------------------------------------------------------------------------------
 if(WIN32)
   add_executable(blmemu WIN32 app/win/main_win.c app/win/audio_wasapi.c app/win/blmemu.rc)
-  target_link_libraries(blmemu blmcore ole32 uuid comdlg32 user32 gdi32 ${STATIC_RUNTIME})
+  target_link_libraries(blmemu blmcore ole32 uuid comdlg32 user32 gdi32 advapi32 ${STATIC_RUNTIME})
   target_link_options(blmemu PRIVATE -municode)
 else()
   add_executable(blmemu app/term/main_term.c app/term/keys_term.c)

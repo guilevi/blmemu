@@ -424,6 +424,13 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_COMMAND:
         command(LOWORD(w));
         return 0;
+    case WM_QUERYENDSESSION:                   /* Windows logging off or shutting down: it may not let the program
+                                                  quit, so the unit's memory is saved now, as each minute's save is */
+        if (g_s) {
+            char err[256];
+            session_save(g_s, err, sizeof err);
+        }
+        return TRUE;
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;

@@ -1,0 +1,3 @@
+[submodule "third_party/librc8650"]
+	path = third_party/librc8650
+	url = https://github.com/guilevi/librc8650.git

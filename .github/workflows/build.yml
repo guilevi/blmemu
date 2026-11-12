@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos, os: macos-14 }
+          - { name: linux, os: ubuntu-22.04 }
+          - { name: windows, os: ubuntu-22.04 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.name }}" = windows ]; then sudo apt-get install -y mingw-w64 zip
+          else sudo apt-get install -y libasound2-dev pkg-config; fi
+      - name: the RC8650's CPU
+        run: tools/prepare_m32c.sh
+      - name: build
+        run: |
+          case ${{ matrix.name }} in
+            macos) cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 ;;
+            linux) cmake -B build -DCMAKE_BUILD_TYPE=Release ;;
+            windows) cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake ;;
+          esac
+          cmake --build build -j4
+      - name: package
+        run: tools/package.sh ${{ matrix.name }} build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blmemu-${{ matrix.name }}
+          path: dist/*.*

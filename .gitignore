@@ -1,0 +1,10 @@
+build*/
+dist/
+third_party/m32c/
+third_party/cache/
+state/
+M40/
+firmware/
+*.state
+*.wav
+.DS_Store

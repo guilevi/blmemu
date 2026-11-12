@@ -1,0 +1,31 @@
+MAME's Z180 instruction core, vendored.
+
+Upstream:  https://github.com/mamedev/mame
+Tree:      c0d36776743 (2026-08-27); last change to src/devices/cpu/z180: e0deaf3898b1 (2026-08-16)
+Path:      src/devices/cpu/z180/
+Licence:   BSD-3-Clause, per file (LICENSE-BSD-3-Clause.txt beside this file)
+Author:    Juergen Buchmueller (copyright-holders line of every file taken)
+
+Copied UNCHANGED: each file's git object hash equals upstream's at the tree above (`git rev-parse HEAD:<path>` in both
+repositories; the blobs are LF, and a Windows checkout's CRLF working copy is git's autocrlf, as in MAME's own):
+  z180ops.h    the instruction helper macros (flags, ALU, block ops, SLP, ...)
+  z180tbl.h    the cycle tables and flag tables
+  z180op.hxx   the unprefixed opcodes
+  z180cb.hxx   CB-prefixed opcodes
+  z180dd.hxx   DD-prefixed (IX) opcodes
+  z180fd.hxx   FD-prefixed (IY) opcodes
+  z180ed.hxx   ED-prefixed opcodes (incl. the Z180's own: MLT, TST, IN0/OUT0, OTIM..., SLP)
+  z180xy.hxx   DDCB / FDCB opcodes
+
+Extracted, not copied: z180.cpp (blob d73e4e271995b731550cfe52cd45264e27517d8b at the tree above).
+../extract_z180_machine.py copies exact line ranges of it into ../z180_mame_machine.cpp (generated: the internal
+registers, MMU, DMA, timers, interrupt check, reset), refusing to run if an anchor line has moved; every change is
+named in the script and marked CHANGED in the output.  z180.h (blob d55c32efe0c68b6493b7569449732a6fe3d4b537) is
+restated, without the framework, in ../z180_mame.hpp.
+
+NOT taken: the rest of z180.cpp / z180.h (MAME's device framework, save states, the debugger state, execute_run --
+our step driver in ../z180_mame.cpp follows it), z180asci.*, z180csio.* (MAME devices; ours are ../z180_asci.*),
+z180dasm.* (the disassembler), hd647180x.* (another part).
+
+To update: copy the same files from a newer MAME, re-run the checks in ../README.md, and record the new revision here.
+Never edit these files in place; any local change belongs in our own files, marked.

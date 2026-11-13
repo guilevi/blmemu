@@ -46,6 +46,7 @@ static WNDPROC g_field_proc;
 static blm_session *g_s;
 static settings *g_ini;
 static int g_braille, g_dots, g_space;
+static int g_reset_hold;                       /* the hard reset's I-chord is held on the unit (TIMER_RELEASE ends it) */
 static unsigned g_seen;
 static uint8_t g_shown[64];
 static int g_n_shown = -1;
@@ -233,14 +234,17 @@ static int unit_key(WPARAM vk, LPARAM lp, int down)
     if (GetKeyState(VK_CONTROL) < 0 || GetKeyState(VK_MENU) < 0) return 0;
     if (down && (lp & (1 << 30))) return key_dot(vk) || vk == VK_SPACE || arrow_chord(vk);   /* auto-repeat */
     if ((d = arrow_chord(vk)) != 0) {
-        if (down) session_chord(g_s, d, 1);
+        if (down && !g_reset_hold) session_chord(g_s, d, 1);
         return 1;
     }
     d = key_dot(vk);
     if (!d && vk != VK_SPACE) return 0;
     if (d) g_dots = down ? g_dots | d : g_dots & ~d;
     else g_space = down;
-    session_keys(g_s, g_dots, g_space);
+    /* While the hard reset's I-chord is held, the keyboard's keys wait: the Enter that chose the menu item comes up
+       a moment after the restart, and telling the unit "no keys down" then let the I-chord go before the firmware
+       had read it, so the unit started as usual and asked nothing. */
+    if (!g_reset_hold) session_keys(g_s, g_dots, g_space);
     return 1;
 }
 
@@ -248,7 +252,7 @@ static void let_go(void)                       /* the window lost the keyboard: 
 {
     if (g_dots || g_space) {
         g_dots = g_space = 0;
-        session_keys(g_s, 0, 0);
+        if (!g_reset_hold) session_keys(g_s, 0, 0);
     }
 }
 
@@ -341,10 +345,13 @@ static void command(int id)
     switch (id) {
     case ID_RESTART:
         let_go();
+        KillTimer(g_wnd, TIMER_RELEASE);
+        g_reset_hold = 0;
         session_restart(g_s, 0, 0);
         break;
     case ID_HARDRESET:
         let_go();
+        g_reset_hold = 1;
         session_restart(g_s, 0x0A, 1);
         SetTimer(g_wnd, TIMER_RELEASE, 1500, NULL);
         break;
@@ -419,6 +426,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_SILENT) run_silent();
         if (w == TIMER_RELEASE) {              /* the hard reset's I-chord comes up */
             KillTimer(h, TIMER_RELEASE);
+            g_reset_hold = 0;
             session_keys(g_s, g_dots, g_space);
         }
         return 0;

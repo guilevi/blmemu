@@ -301,6 +301,12 @@ static uint8_t io_read(void *ctx, uint16_t port)
     case 0xF0: case 0xF1: case 0xF2: case 0xF5: case 0xF6:
         v = u->port_f[p & 7];
         break;
+    case 0x84:
+        /* bit 1: the battery is low (the half-second tick at 0807h: IN0 A,(84h), BIT 1,A, and when set a flag at
+           D40Fh that has the unit say "battery low" after 88 s and every 125 s from then on).  A unit on a good
+           battery reads it clear.  The other bits are not read there; left high. */
+        v = 0xFD;
+        break;
     case 0xD0:                         /* read in every delay loop and the key handler: its value is thrown away */
         break;
     default:

@@ -5,6 +5,10 @@ Linux. It runs the unit's own firmware on an emulated Z180, and its DoubleTalk s
 an emulated M16C (librc8650). Nothing is scripted or recorded. The unit's own program does the talking, shows its own
 braille on its 40-cell display, and keeps its files in its own RAM and flash.
 
+## LLM disclaimer
+
+All of the code here is written by an LLM. To be honest, most of the documentation is as well. I'm posting these projects publicly for the purposes of preservation, archival and whatever else people might want to do with it. Emulation is a sort of byproduct of my interest in learning how these devices worked internally and I'm frankly not super invested in polishing the emulation experience for myself. This is not to say I won't take issues or PRs seriously, but I don't tend to spend more time in these programs than it takes to test them.
+
 ## What you need
 
 Neither firmware comes with the emulator. You bring your own copies, once:

@@ -36,6 +36,7 @@
 #define BLM_BOARD_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,13 +55,13 @@ typedef struct {
 } blm_host;
 
 /* image: the 256 KB program (the .BNS update's image, blm_find_image).  NULL on failure. */
-blm_unit *blm_create(const uint8_t *image, long len, const blm_host *host);
+blm_unit *blm_create(const uint8_t *image, long len, const blm_host *host, char *err, size_t errlen);
 void blm_destroy(blm_unit *u);
 
 /* Finds the program in a .BNS update file: its offset, or -1.  The program starts F3 C3 xx xx FF "COPYRIGHT". */
 long blm_find_image(const uint8_t *data, long n);
 
-void blm_run(blm_unit *u, uint64_t cycles);        /* run that many CPU cycles (6.144 MHz) */
+int blm_run(blm_unit *u, uint64_t cycles, char *err, size_t errlen); /* 0, or -1 with a diagnostic */
 uint64_t blm_cycles(const blm_unit *u);
 double blm_clock_hz(const blm_unit *u);
 
@@ -78,7 +79,7 @@ int blm_display_latches(const blm_unit *u);        /* how many times it has latc
 /* The power switch.  Off: the firmware notices on its next 10 ms tick, saves what it keeps, and stops
    (blm_powered_down then says so; save the state after that).  On: the CPU starts again from its reset vector with
    the RAM as it was, as the unit does. */
-void blm_power(blm_unit *u, int on);
+int blm_power(blm_unit *u, int on, char *err, size_t errlen);
 int blm_powered_down(const blm_unit *u);
 
 /* The Braille Display Mode switch on the left side (the manual, "M40 Ports and Switches"): on (toward the front),

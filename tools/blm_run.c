@@ -101,6 +101,7 @@ int main(int argc, char **argv)
     double seconds = 30, key_t[256];
     int key_d[256], key_s[256], n_keys = 0, factory = 0, i, trace = 0;
     host_ctx h;
+    char err[256];
     memset(&h, 0, sizeof h);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--factory")) factory = 1;
@@ -154,7 +155,6 @@ int main(int argc, char **argv)
     if (off < 0) { fprintf(stderr, "%s: no program image found\n", fw); return 1; }
 
     if (wav) {
-        char err[256];
         if (!dtfw) dtfw = getenv("RC8650_FIRMWARE");
         if (!dtfw) { fprintf(stderr, "--wav needs --dt-fw (the RC8650's firmware .srec)\n"); return 2; }
         h.dt = blm_dt_new(dtfw, err, sizeof err);
@@ -162,8 +162,9 @@ int main(int argc, char **argv)
     }
 
     blm_host host = { &h, dt_write, dt_status };
-    blm_unit *u = blm_create(data + off, n - off, &host);
-    if (!u) { fprintf(stderr, "blm_create failed\n"); return 1; }
+    blm_unit *u = blm_create(data + off, n - off, &host, err, sizeof err);
+    free(data);
+    if (!u) { fprintf(stderr, "%s\n", err); return 1; }
     if (trace) blm_trace(u, stderr, trace);
     if (state && blm_load(u, state)) { fprintf(stderr, "%s: not a state\n", state); return 1; }
     if (factory) blm_factory(u);
@@ -197,7 +198,7 @@ int main(int argc, char **argv)
             blm_chord(u, 0x3D, 0);
             h.yes_at = 0;
         }
-        blm_run(u, (uint64_t)(SLICE_S * hz));
+        if (blm_run(u, (uint64_t)(SLICE_S * hz), err, sizeof err)) { fprintf(stderr, "%s\n", err); goto fail; }
         if (blm_display_latches(u) != last_latch) {
             uint8_t c[BLM_MAX_CELLS];
             int nc = blm_cells(u, c, BLM_MAX_CELLS), j;
@@ -238,15 +239,22 @@ int main(int argc, char **argv)
         for (j = 0; j < l && df; j++) fputc(blm_peek(u, a + j), df);
         if (df) fclose(df);
     }
-    if (wf) { wav_header(wf, RC8650_SAMPLE_RATE, n_samples); fclose(wf); }
+    if (wf) { wav_header(wf, RC8650_SAMPLE_RATE, n_samples); fclose(wf); wf = NULL; }
     if (save) {                               /* switched off first, as a person would, then saved */
         int i;
-        blm_power(u, 0);
-        for (i = 0; i < 400 && !blm_powered_down(u); i++) blm_run(u, (uint64_t)(0.005 * hz));
+        if (blm_power(u, 0, err, sizeof err)) { fprintf(stderr, "%s\n", err); goto fail; }
+        for (i = 0; i < 400 && !blm_powered_down(u); i++)
+            if (blm_run(u, (uint64_t)(0.005 * hz), err, sizeof err)) { fprintf(stderr, "%s\n", err); goto fail; }
         printf("[%7.2f] %s\n", h.now + i * 0.005, blm_powered_down(u) ? "switched off" : "did not power down");
+        if (!blm_powered_down(u)) goto fail;
     }
-    if (save && blm_save(u, save)) { perror(save); return 1; }
+    if (save && blm_save(u, save)) { perror(save); goto fail; }
     blm_destroy(u);
     if (h.dt) blm_dt_free(h.dt);
     return 0;
+fail:
+    if (wf) fclose(wf);
+    blm_destroy(u);
+    if (h.dt) blm_dt_free(h.dt);
+    return 1;
 }

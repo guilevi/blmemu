@@ -5,7 +5,7 @@
 #
 # Windows from macOS or Linux: cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake
 cmake_minimum_required(VERSION 3.16)
-project(blmemu VERSION 0.1.0 LANGUAGES C CXX)
+project(blmemu VERSION 0.1.0 LANGUAGES C)
 if(WIN32)
   enable_language(RC)
 endif()
@@ -20,7 +20,6 @@ if(NOT EXISTS "${M32C_DIR}/gen/m32c.c")
 endif()
 
 set(CMAKE_C_STANDARD 99)
-set(CMAKE_CXX_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -43,15 +42,14 @@ if(NOT WIN32)
   target_link_libraries(rc8650 PUBLIC m)
 endif()
 
-# ---- MAME's Z180 core (BSD-3-Clause) ---------------------------------------------------------------------------------
-add_library(z180 STATIC src/cpu/z180_mame.cpp src/cpu/z180_asci.cpp)
-target_include_directories(z180 PUBLIC src/cpu)
+# ---- z-core's C ABI ------------------------------------------------------------------------------------------------
+include(cmake/z-core.cmake)
 
 # ---- the unit ----------------------------------------------------------------------------------------------------
 add_library(blmcore STATIC
   src/blm_board.c src/sharp_flash.c src/blm_dt.c src/shell/fwstore.c src/shell/session.c src/shell/settings.c)
 target_include_directories(blmcore PUBLIC src src/shell)
-target_link_libraries(blmcore PUBLIC z180 rc8650)
+target_link_libraries(blmcore PUBLIC zcore_ffi rc8650)
 if(NOT WIN32)
   find_package(Threads REQUIRED)
   target_link_libraries(blmcore PUBLIC Threads::Threads)
@@ -61,11 +59,25 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 if(MINGW)
   # one program, nothing beside it to install
-  set(STATIC_RUNTIME -static -static-libgcc -static-libstdc++)
+  set(STATIC_RUNTIME -static -static-libgcc)
 endif()
 
 add_executable(blm_run tools/blm_run.c)
 target_link_libraries(blm_run blmcore ${STATIC_RUNTIME})
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(board_test tests/board_test.c)
+  target_link_libraries(board_test blmcore ${STATIC_RUNTIME})
+  add_test(NAME board COMMAND board_test)
+  # Requires private firmware and disposable BLMEMU_HOME; never register a silent CI skip.
+  add_executable(session_test tests/session_test.c)
+  target_link_libraries(session_test blmcore ${STATIC_RUNTIME})
+  if(NOT APPLE)
+    target_compile_definitions(session_test PRIVATE TEST_ALLOC_FAILURE)
+    target_link_options(session_test PRIVATE -Wl,--wrap=calloc)
+  endif()
+endif()
 
 # ---- the program a person runs -------------------------------------------------------------------------------------
 if(WIN32)

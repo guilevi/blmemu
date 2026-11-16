@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
       - name: tools
         if: runner.os == 'Linux'
         run: |
@@ -33,10 +33,13 @@ jobs:
         run: |
           case ${{ matrix.name }} in
             macos) cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 ;;
-            linux) cmake -B build -DCMAKE_BUILD_TYPE=Release ;;
+            linux) cmake -B build -DCMAKE_BUILD_TYPE=Release -DZCORE_PREBUILT=OFF ;; # z-core from source, with Rust
             windows) cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake ;;
           esac
           cmake --build build -j4
+      - name: board tests
+        if: matrix.name != 'windows'
+        run: ctest --test-dir build --output-on-failure
       - name: package
         run: tools/package.sh ${{ matrix.name }} build
       - uses: actions/upload-artifact@v4

@@ -125,7 +125,7 @@ The clock starts from your computer's date and time and runs on from there. Set 
 
 ## Building
 
-You need CMake, a C/C++ compiler, and `git submodule update --init` (librc8650 is a submodule). Then:
+You need CMake, a C compiler, and `git submodule update --init` (librc8650 and z-core are submodules). Then:
 
     tools/prepare_m32c.sh            # once: fetches GDB 14.2, takes its m32c simulator, applies librc8650's patch
     cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -134,9 +134,26 @@ You need CMake, a C/C++ compiler, and `git submodule update --init` (librc8650 i
 - **Windows** from macOS or Linux with mingw-w64: `cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64.cmake`.
 - **On Windows itself** with [w64devkit](https://github.com/skeeto/w64devkit) (its `bin` on the PATH, with Git and
   CMake): `sh tools/prepare_m32c.sh`, then `cmake -B build -G "MinGW Makefiles"` and `cmake --build build`.
+- **Universal macOS:** configure CMake with `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0`.
 - **Linux** needs `libasound2-dev`.
 - **A release:** `tools/package.sh macos|linux|windows BUILD_DIR`.
-- **CI:** `.github/workflows/build.yml` builds all three.
+- **Tests:** `ctest --test-dir build --output-on-failure` runs synthetic board programs without proprietary firmware.
+- **CI:** `.github/workflows/build.yml` builds all three and runs board tests on Linux/macOS. The Windows cross-build
+  compiles the same tests; run `build/board_test.exe` on Windows. Linux builds z-core from source; the others use its release.
+
+The Z180 is [z-core](https://github.com/ctoth/z-core)'s C library. CMake downloads the static library z-core's release
+publishes for your platform (x86_64 Linux, MinGW Windows, universal macOS) and checks its SHA-256; without network
+access, put that `.tar.gz` in the build directory first. To build it from the submodule instead, install Rust/Cargo and
+configure with `-DZCORE_PREBUILT=OFF` (Windows also needs `rustup target add x86_64-pc-windows-gnu`, universal macOS
+`aarch64-apple-darwin` and `x86_64-apple-darwin`). `-DZCORE_DIR=PATH` selects another z-core source tree; set
+`ZCORE_DIR` to that same path when packaging. The board owns its banked memory and saved state; z-core owns the Z180,
+MMU and internal peripherals.
+
+`build/session_test BNS RC8650_SREC BASELINE_STATE` exercises real speech, saved text and session restart using your
+own firmware and a previously saved test unit containing file A with the word "test". Set `BLMEMU_HOME` to a disposable
+directory first: the test imports the firmware and replaces the state in that directory. It never opens an audio
+device or a window. Linux/MinGW builds also test failed factory allocation and safe controls after that failure.
+This private-firmware test is built by CI but requires these explicit inputs to run; it is not registered as a skipped test.
 
 `build/blm_run` runs the unit headless: keys on a schedule, what it says, its display, a WAV, traces of the hardware.
 Run it without arguments for its options. `src/blm_board.h` describes the Millennium's hardware as the firmware uses
@@ -149,8 +166,8 @@ wouldn't exist without it. ssi263-speech brought the Blazie units back to life: 
 Speak and the Type 'n Speak, running their own firmware. The Millennium is their direct descendant, and almost
 everything here stands on that work:
 
-- **The CPU.** The Z180, MAME's core behind ssi263-speech's step driver and its carefully worked-out timing contract,
-  runs here unchanged.
+- **The original CPU integration.** Its step driver and timing contract established how the board ran. The CPU now
+  uses [z-core](https://github.com/ctoth/z-core), through its context-aware C ABI and opcode-fetch observer.
 - **The board.** Its shape and its way of working come from the Braille Lite 2000's: the firmware's banked calls, the
   power switch, the flash and the clock found by running the firmware and reading what it does. Even the braille
   display's dot wiring is the same, and decoding it was a matter of checking the Millennium against what ssi263-speech
@@ -164,6 +181,6 @@ Thank you for doing that work so carefully, and for making it open.
 
 ## Licence
 
-GPL-3.0-or-later (`LICENSE`), because librc8650 and GDB's simulator are GPL-3. The Z180 core is MAME's (BSD-3-Clause),
-behind a driver from ssi263-speech's Blazie emulator (MIT). `licenses/NOTICE.md` lists every part. The firmware is not
+GPL-3.0-or-later (`LICENSE`), because librc8650 and GDB's simulator are GPL-3. The Z180 core is z-core (MIT), and the
+board retains work derived from ssi263-speech's Blazie emulator (MIT). `licenses/NOTICE.md` lists every part. The firmware is not
 part of the program and keeps its own terms.

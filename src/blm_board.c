@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include "cpu/cpu.h"
+#include "z180.h"
 #include "blm_board.h"
 #include "sharp_flash.h"
 #include "u8file.h"
@@ -17,7 +17,6 @@
 #define CLOCK_HZ 6144000.0
 #define KQ 256
 #define KEY_GAP_CYCLES 6144          /* the keyboard controller's pace between bytes: 1 ms (model) */
-#define CSIO_CYCLES 320              /* a CSI/O byte at the internal clock: 8 bits at PHI/40 (the firmware's SS) */
 #define SAVE_MAGIC "BLMSTATE2"
 
 typedef struct {                      /* the DS1305-like clock on the CSI/O */
@@ -31,7 +30,13 @@ struct blm_unit {
     uint8_t *flash;                   /* the program flash, both banks */
     uint8_t *ram;                     /* 2 MB */
     sharp_flash ff[N_FFLASH];         /* the file flash: F5h 40h-7Fh, 80h-BFh, C0h-FFh with F6h = 00h */
-    z180 *cpu;
+    z180_machine *cpu;
+    uint64_t cycles;                  /* charged native time; callbacks supply their own exact context */
+    uint16_t pc;
+    int irq2, fetching;
+    int irq2_applied;                 /* the INT2 level z-core has; -1 after a reset forces it again */
+    int csio_active;                  /* a CNTR write started a transfer that has not gone idle */
+    unsigned asci_written[2], asci_popped[2]; /* TDR writes vs bytes taken back from z-core */
     blm_host host;
     uint8_t port_e0, port_80;
     int power_off;                    /* the power switch, off (E0h bit 6 low) */
@@ -52,8 +57,6 @@ struct blm_unit {
     int disp_n, disp_clk;
     uint8_t cells[BLM_MAX_CELLS];
     int n_cells, disp_latches;
-    uint64_t csio_done;
-    int csio_armed;
     blm_rtc rtc;
     uint32_t last_fetch;
     FILE *tr;
@@ -94,7 +97,7 @@ static void civil_from_days(long long z, int *y, int *m, int *d)
 
 static long long rtc_now(const blm_unit *u)
 {
-    return u->rtc.base + (long long)((double)(z180_cycles(u->cpu) - u->rtc.c0) / CLOCK_HZ);
+    return u->rtc.base + (long long)((double)(u->cycles - u->rtc.c0) / CLOCK_HZ);
 }
 
 static void rtc_fields(const blm_unit *u, uint8_t *out)   /* 00h-06h */
@@ -121,7 +124,7 @@ static void rtc_set_field(blm_unit *u, int reg, uint8_t v)
     if (m < 1 || m > 12) m = 1;
     if (d < 1 || d > 31) d = 1;
     u->rtc.base = days_from_civil(y, m, d) * 86400 + hh * 3600 + mm * 60 + ss;
-    u->rtc.c0 = z180_cycles(u->cpu);
+    u->rtc.c0 = u->cycles;
 }
 
 static uint8_t rtc_read(blm_unit *u, int reg)
@@ -136,7 +139,7 @@ static uint8_t rtc_read(blm_unit *u, int reg)
 
 /* one byte over SPI while the clock is selected: `in` from the Z180 (MSB first, already un-reversed); returns what
    the clock drives back */
-static uint8_t rtc_byte(blm_unit *u, uint8_t in, int te)
+static uint8_t rtc_byte(blm_unit *u, uint8_t in, int te, int commit)
 {
     blm_rtc *r = &u->rtc;
     if (r->first) {
@@ -154,7 +157,7 @@ static uint8_t rtc_byte(blm_unit *u, uint8_t in, int te)
     }
     if (!r->write) {
         uint8_t v = rtc_read(u, r->addr);
-        r->addr = (r->addr + 1) & 0x7F;
+        if (commit) r->addr = (r->addr + 1) & 0x7F;
         return v;
     }
     return 0xFF;
@@ -225,10 +228,18 @@ static void ext_write(blm_unit *u, uint32_t a, uint8_t v)
 }
 
 /* ---- the bus ----------------------------------------------------------------------------------------------------- */
-static uint8_t mem_read(void *ctx, uint32_t a)
+static int32_t mem_read(void *ctx, uint32_t a, const z180_bus_context *at, uint8_t *out)
 {
     blm_unit *u = (blm_unit *)ctx;
     uint8_t v;
+    u->cycles = at->cycles;
+    u->pc = at->pc;
+    if (u->fetching && (u->tr_what & BLM_TR_FAR) && u->tr && at->pc == 0x63FD) {
+        unsigned t = (unsigned)(u->far_b[0] | u->far_b[1] << 8);
+        fprintf(u->tr, "FAR %llu -> %04X bank %02X (phys %05X)\n", (unsigned long long)at->cycles,
+                t, u->far_b[2], t + u->far_b[2] * 0x1000u);
+    }
+    u->fetching = 0;
     a &= 0xFFFFF;
     u->page_r[a >> 12]++;
     if (a >= 0x84000 && u->tr && (u->tr_what & BLM_TR_MEM) && a != u->last_fetch)
@@ -236,25 +247,28 @@ static uint8_t mem_read(void *ctx, uint32_t a)
                 u->port_f[0], u->port_f[6], u->port_f[5], (unsigned)u->last_fetch);
     v = a < ROM_SIZE ? u->flash[((u->port_e0 & 0x02) ? ROM_SIZE : 0) + a] : ext_read(u, a);
     if (u->tr && (u->tr_what & BLM_TR_FAR)) {        /* the far-call stub's operands: CALL 63F0h; dw target; db bbr */
-        uint32_t pc = z180_pc(u->cpu);
+        uint32_t pc = at->pc;
         if (pc == 0x63F4) u->far_b[0] = v;
         else if (pc == 0x63F6) u->far_b[1] = v;
         else if (pc == 0x63FB) u->far_b[2] = v;
     }
-    return v;
+    *out = v;
+    return 0;
 }
 
-static uint8_t mem_fetch(void *ctx, uint32_t a)
+static void mem_fetch(void *ctx, uint32_t a)
 {
     blm_unit *u = (blm_unit *)ctx;
     u->last_fetch = a & 0xFFFFF;
     u->fetch_hist[u->last_fetch >> 8]++;
-    return mem_read(ctx, a);
+    u->fetching = 1;
 }
 
-static void mem_write(void *ctx, uint32_t a, uint8_t v)
+static int32_t mem_write(void *ctx, uint32_t a, uint8_t v, const z180_bus_context *at)
 {
     blm_unit *u = (blm_unit *)ctx;
+    u->cycles = at->cycles;
+    u->pc = at->pc;
     a &= 0xFFFFF;
     u->page_w[a >> 12]++;
     if (a >= 0x84000 && u->tr && (u->tr_what & BLM_TR_MEM))
@@ -263,9 +277,10 @@ static void mem_write(void *ctx, uint32_t a, uint8_t v)
     if (a < ROM_SIZE) {
         if (u->tr && (u->tr_what & BLM_TR_UNKNOWN))
             fprintf(u->tr, "FLASHW %05X <- %02X pc=%05X\n", (unsigned)a, v, (unsigned)u->last_fetch);
-        return;
+        return 0;
     }
     ext_write(u, a, v);
+    return 0;
 }
 
 static int internal_port(uint16_t p) { return (p & 0xFF00) == 0 && (p & 0xC0) == 0; }
@@ -274,23 +289,24 @@ static void unknown(blm_unit *u, int wr, uint16_t p, uint8_t v)
 {
     if (u->tr && (u->tr_what & BLM_TR_UNKNOWN) && u->unknown_n[p & 0xFF][wr]++ < 8)
         fprintf(u->tr, "%s %02X %s %02X pc=%04X/%05X cyc=%llu\n", wr ? "OUT" : "IN ", p & 0xFF, wr ? "<-" : "->", v,
-                (unsigned)z180_pc(u->cpu), (unsigned)u->last_fetch, (unsigned long long)z180_cycles(u->cpu));
+                (unsigned)u->pc, (unsigned)u->last_fetch, (unsigned long long)u->cycles);
 }
 
-static uint8_t io_read(void *ctx, uint16_t port)
+static int32_t io_read(void *ctx, uint16_t port, const z180_bus_context *at, uint8_t *out)
 {
     blm_unit *u = (blm_unit *)ctx;
     int p = port & 0xFF;
     uint8_t v = 0xFF;
-    if (internal_port(port))
-        return 0xFF;                   /* the core answers its own registers; this is the bus's echo */
+    u->cycles = at->cycles;
+    u->pc = at->pc;
+    if (internal_port(port)) { *out = 0xFF; return 0; } /* internal register bus echo */
     switch (p) {
     case 0x8C:
         v = (uint8_t)(0xDE | (u->k_busy ? 0 : 0x20) | u->k_data);
         break;
     case 0x90:
         v = u->host.dt_status ? u->host.dt_status(u->host.ctx) : 0x14;
-        if (z180_cycles(u->cpu) < u->dt_busy_until)
+        if (u->cycles < u->dt_busy_until)
             v &= (uint8_t)~0x10;       /* RDY drops briefly after each write: the chip's receipt (datasheet, 8 us min.) */
         break;
     case 0xE0:
@@ -308,7 +324,8 @@ static uint8_t io_read(void *ctx, uint16_t port)
     }
     if (u->tr && (u->tr_what & BLM_TR_IO))
         fprintf(u->tr, "IN  %02X -> %02X pc=%05X\n", p, v, (unsigned)u->last_fetch);
-    return v;
+    *out = v;
+    return 0;
 }
 
 static void key_reset(blm_unit *u)
@@ -317,18 +334,23 @@ static void key_reset(blm_unit *u)
         u->kq_t--;                     /* the byte being shifted is sent again after the reset */
     u->k_busy = 0;
     u->k_bits = 0;
-    z180_set_irq(u->cpu, Z180_INT2, 0);
+    u->irq2 = 0;
 }
 
-static void io_write(void *ctx, uint16_t port, uint8_t v)
+static int32_t io_write(void *ctx, uint16_t port, uint8_t v, const z180_bus_context *at)
 {
     blm_unit *u = (blm_unit *)ctx;
     int p = port & 0xFF;
+    u->cycles = at->cycles;
+    u->pc = at->pc;
     if (internal_port(port)) {
         if (u->tr && (u->tr_what & BLM_TR_INTERNAL) && !(p >= 0x0C && p <= 0x13) && !(p >= 0x38 && p <= 0x3A))
             fprintf(u->tr, "OUT0 %02X <- %02X pc=%05X cyc=%llu\n", p, v, (unsigned)u->last_fetch,
-                    (unsigned long long)z180_cycles(u->cpu));
-        return;
+                    (unsigned long long)u->cycles);
+        /* z-core shows the board its own register writes first: note what service() must follow */
+        if (p == 0x0A && (v & 0x30)) u->csio_active = 1;  /* CNTR: TE or RE starts a CSI/O byte */
+        if (p == 0x06 || p == 0x07) u->asci_written[p - 6]++; /* TDR0/TDR1: an ASCI byte to send */
+        return 0;
     }
     if (u->tr && (u->tr_what & BLM_TR_IO))
         fprintf(u->tr, "OUT %02X <- %02X pc=%05X\n", p, v, (unsigned)u->last_fetch);
@@ -342,8 +364,8 @@ static void io_write(void *ctx, uint16_t port, uint8_t v)
             u->k_data = (u->k_cur >> (7 - u->k_bits)) & 1;
             if (++u->k_bits == 8) {
                 u->k_busy = 0;
-                z180_set_irq(u->cpu, Z180_INT2, 0);
-                u->k_next = z180_cycles(u->cpu) + KEY_GAP_CYCLES;
+                u->irq2 = 0;
+                u->k_next = u->cycles + KEY_GAP_CYCLES;
             }
         }
         u->k_clk = clk;
@@ -354,7 +376,7 @@ static void io_write(void *ctx, uint16_t port, uint8_t v)
             fprintf(u->tr, "DT %02X %c\n", v, v >= 32 && v < 127 ? v : '.');
         if (u->host.dt_write)
             u->host.dt_write(u->host.ctx, v);
-        u->dt_busy_until = z180_cycles(u->cpu) + 60;
+        u->dt_busy_until = u->cycles + 60;
         break;
     case 0x88: {
         int clk = (v >> 1) & 1;
@@ -404,62 +426,58 @@ static void io_write(void *ctx, uint16_t port, uint8_t v)
     default:
         unknown(u, 1, port, v);
     }
+    return 0;
 }
 
-static void boundary(void *ctx, uint32_t pc)
+static int cpu_result(int32_t status, const z180_error *e, char *err, size_t errlen)
 {
-    blm_unit *u = (blm_unit *)ctx;
-    uint64_t now = z180_cycles(u->cpu);
-    (void)pc;
+    if (status == Z180_OK) return 0;
+    snprintf(err, errlen, "Z180 error %d (host %d): %s", (int)status, (int)e->host_code, e->message);
+    return -1;
+}
+
+static int service(blm_unit *u, char *err, size_t errlen)
+{
+    z180_error e;
+    uint8_t present, value, cntr, accepted;
+    uint64_t now = u->cycles;
     /* the keyboard controller's next byte */
     if (!u->k_busy && !u->k_hold && u->kq_t != u->kq_h && now >= u->k_next) {
         u->k_cur = u->kq[u->kq_t++ % KQ];
         u->k_busy = 1;
         u->k_bits = 0;
         u->k_data = 0;
-        z180_set_irq(u->cpu, Z180_INT2, 1);
+        u->irq2 = 1;
         if (u->tr && (u->tr_what & BLM_TR_KEYS))
             fprintf(u->tr, "KEY %02X\n", u->k_cur);
     }
-    /* the CSI/O on its own clock: a byte takes CSIO_CYCLES from the moment TE or RE is set */
-    {
-        uint8_t cntr = z180_csio_cntr(u->cpu);
-        int armed = cntr & 0x30;
-        if (armed && (cntr & 7) != 7) {
-            if (!u->csio_armed) {
-                u->csio_armed = 1;
-                u->csio_done = now + CSIO_CYCLES;
-            } else if (now >= u->csio_done) {
-                uint8_t sent = 0xFF, in = 0xFF;
-                /* what goes out is TRDR (if TE); what the clock returns depends on it, so ask the clock first with
-                   the outgoing byte (TRDR is not readable without side effects: the core hands it over here) */
-                uint8_t dummy;
-                int te = armed & 0x10;
-                if (te) {
-                    z180_csio_clock(u->cpu, 0xFF, &sent);
-                    if (u->rtc.selected) rtc_byte(u, rev8(sent), 1);
-                } else {
-                    if (u->rtc.selected) in = rev8(rtc_byte(u, 0xFF, 0));
-                    z180_csio_clock(u->cpu, in, &dummy);
-                }
-                u->csio_armed = 0;
-            }
-        } else
-            u->csio_armed = 0;
+    /* z-core is asked only when something can have changed: each call costs as much as a short instruction */
+    if (u->irq2 != u->irq2_applied) {
+        if (cpu_result(z180_set_irq(u->cpu, Z180_INT2, (uint8_t)u->irq2, &e), &e, err, errlen)) return -1;
+        u->irq2_applied = u->irq2;
     }
-    if (u->tr && (u->tr_what & BLM_TR_FAR) && pc == 0x63FD) {
-        unsigned t = (unsigned)(u->far_b[0] | u->far_b[1] << 8);
-        fprintf(u->tr, "FAR %llu -> %04X bank %02X (phys %05X)\n", (unsigned long long)now, t, u->far_b[2],
-                t + u->far_b[2] * 0x1000u);
+    if (u->csio_active) {
+        do {
+            if (cpu_result(z180_csio_tx_pop(u->cpu, &present, &value, &e), &e, err, errlen)) return -1;
+            if (present && u->rtc.selected) rtc_byte(u, rev8(value), 1, 1);
+        } while (present);
+        if (cpu_result(z180_io_reg_peek(u->cpu, 0x0a, &cntr, &e), &e, err, errlen)) return -1;
+        if ((cntr & 0x20) && (cntr & 7) != 7) {
+            value = u->rtc.selected ? rev8(rtc_byte(u, 0xff, 0, 0)) : 0xff;
+            if (cpu_result(z180_csio_rx_push(u->cpu, value, &accepted, &e), &e, err, errlen)) return -1;
+            if (accepted && u->rtc.selected) rtc_byte(u, 0xff, 0, 1);
+        }
+        if (!(cntr & 0x30)) u->csio_active = 0;     /* TE and RE clear, its byte taken: idle */
     }
-}
-
-static int serial_rx(void *ctx, int ch) { (void)ctx; (void)ch; return -1; }
-static void serial_tx(void *ctx, int ch, uint8_t b)
-{
-    blm_unit *u = (blm_unit *)ctx;
-    if (u->tr && (u->tr_what & BLM_TR_UNKNOWN))
-        fprintf(u->tr, "TX%d %02X\n", ch, b);
+    for (unsigned ch = 0; ch < 2; ch++) {
+        while (u->asci_popped[ch] != u->asci_written[ch]) {
+            if (cpu_result(z180_asci_tx_pop(u->cpu, ch, &present, &value, &e), &e, err, errlen)) return -1;
+            if (!present) break;
+            u->asci_popped[ch]++;
+            if (u->tr && (u->tr_what & BLM_TR_UNKNOWN)) fprintf(u->tr, "TX%u %02X\n", ch, value);
+        }
+    }
+    return 0;
 }
 
 /* ---- the unit ---------------------------------------------------------------------------------------------------- */
@@ -474,36 +492,35 @@ long blm_find_image(const uint8_t *data, long n)
     return -1;
 }
 
-blm_unit *blm_create(const uint8_t *image, long len, const blm_host *host)
+blm_unit *blm_create(const uint8_t *image, long len, const blm_host *host, char *err, size_t errlen)
 {
     blm_unit *u = (blm_unit *)calloc(1, sizeof *u);
-    cpu_bus bus;
+    z180_config config;
+    z180_error e;
+    z180_region region = {0, 0x100000, Z180_REGION_EXTERNAL, NULL, 0};
+    z180_context_bus bus = {u, mem_read, mem_write, io_read, io_write};
+    z180_fetch_observer fetch = {u, mem_fetch};
     time_t t;
     struct tm *lt;
-    if (!u) return NULL;
+    if (!u) { snprintf(err, errlen, "out of memory"); return NULL; }
+    if (!image || len <= 0) { snprintf(err, errlen, "empty program image"); goto fail; }
     u->flash = (uint8_t *)malloc(2 * ROM_SIZE);
     u->ram = (uint8_t *)calloc(1, RAM_SIZE);
-    if (!u->flash || !u->ram) { blm_destroy(u); return NULL; }
+    if (!u->flash || !u->ram) { snprintf(err, errlen, "out of memory"); goto fail; }
     for (int i = 0; i < N_FFLASH; i++)
-        if (sf_init(&u->ff[i])) { blm_destroy(u); return NULL; }
+        if (sf_init(&u->ff[i])) { snprintf(err, errlen, "out of memory"); goto fail; }
     memset(u->flash, 0xFF, 2 * ROM_SIZE);
     if (len > (long)ROM_SIZE) len = (long)ROM_SIZE;
     memcpy(u->flash, image, (size_t)len);
     memcpy(u->flash + ROM_SIZE, image, (size_t)len);
     if (host) u->host = *host;
-    memset(&bus, 0, sizeof bus);
-    bus.ctx = u;
-    bus.read = mem_read;
-    bus.fetch = mem_fetch;
-    bus.write = mem_write;
-    bus.in = io_read;
-    bus.out = io_write;
-    bus.boundary = boundary;
-    bus.serial_rx = serial_rx;
-    bus.serial_tx = serial_tx;
-    u->cpu = z180_create(&bus, CLOCK_HZ);
-    if (!u->cpu) { blm_destroy(u); return NULL; }
-    z180_reset(u->cpu);
+    if (cpu_result(z180_config_init(&config, &e), &e, err, errlen)) goto fail;
+    config.variant = Z180_Z8S180;
+    config.clock_hz = (uint32_t)CLOCK_HZ;
+    config.phys_addr_bits = 20;
+    config.event_capacity = 0;
+    if (cpu_result(z180_create_with_context(&config, &region, 1, &bus, &u->cpu, &e), &e, err, errlen)) goto fail;
+    if (cpu_result(z180_set_fetch_observer(u->cpu, &fetch, &e), &e, err, errlen)) goto fail;
     t = time(NULL);
     lt = localtime(&t);
     u->rtc.base = days_from_civil(lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday) * 86400 + lt->tm_hour * 3600 +
@@ -514,6 +531,9 @@ blm_unit *blm_create(const uint8_t *image, long len, const blm_host *host)
     u->port_f[6] = 0x01;
     u->rtc.reg[0x0F] = 0x40;          /* control: oscillator on, write-protected (DS1305 power-on) */
     return u;
+fail:
+    blm_destroy(u);
+    return NULL;
 }
 
 void blm_destroy(blm_unit *u)
@@ -526,16 +546,26 @@ void blm_destroy(blm_unit *u)
     free(u);
 }
 
-void blm_run(blm_unit *u, uint64_t cycles)
+int blm_run(blm_unit *u, uint64_t cycles, char *err, size_t errlen)
 {
-    uint64_t end = z180_cycles(u->cpu) + cycles;
-    while (z180_cycles(u->cpu) < end)
-        z180_step(u->cpu);
+    z180_error e;
+    if (!cycles) return 0;
+    if (service(u, err, errlen)) return -1;
+    while (cycles) {
+        uint64_t before = u->cycles, charged = 0;
+        int32_t status = z180_step(u->cpu, &charged, &e);
+        u->cycles = before + charged;
+        if (cpu_result(status, &e, err, errlen)) return -1;
+        if (!charged) { snprintf(err, errlen, "Z180 made no cycle progress"); return -1; }
+        if (service(u, err, errlen)) return -1;
+        cycles = charged >= cycles ? 0 : cycles - charged;
+    }
+    return 0;
 }
 
-uint64_t blm_cycles(const blm_unit *u) { return z180_cycles(u->cpu); }
+uint64_t blm_cycles(const blm_unit *u) { return u->cycles; }
 double blm_clock_hz(const blm_unit *u) { (void)u; return CLOCK_HZ; }
-uint32_t blm_pc(const blm_unit *u) { return z180_pc(u->cpu); }
+uint32_t blm_pc(const blm_unit *u) { return u->pc; }
 uint32_t blm_phys_pc(const blm_unit *u) { return u->last_fetch; }
 uint8_t blm_peek(const blm_unit *u, uint32_t a)
 {
@@ -637,19 +667,29 @@ int blm_cells(const blm_unit *u, uint8_t *cells, int cap)
 
 int blm_display_latches(const blm_unit *u) { return u->disp_latches; }
 
-void blm_power(blm_unit *u, int on)
+int blm_power(blm_unit *u, int on, char *err, size_t errlen)
 {
     if (on && u->power_off) {          /* switched on: the CPU starts from its reset vector, the RAM as it was */
+        z180_error e;
+        if (cpu_result(z180_reset(u->cpu, &e), &e, err, errlen)) return -1;
         u->power_off = 0;
-        z180_reset(u->cpu);
+        u->pc = 0;
+        u->last_fetch = 0;
+        u->fetching = 0;
+        u->irq2 = 0;
+        u->irq2_applied = -1;
+        u->csio_active = 0;
+        u->asci_written[0] = u->asci_written[1] = u->asci_popped[0] = u->asci_popped[1] = 0;
         u->port_e0 = 0;
         u->kq_t = u->kq_h;
         u->k_busy = u->k_hold = 0;
         u->k_dots = u->k_space = 0;
-        u->csio_armed = 0;
+        u->k_next = u->cycles;
+        u->dt_busy_until = u->cycles;
         u->disp_n = 0;
     } else if (!on)
         u->power_off = 1;              /* the firmware sees it on its next tick and powers itself down */
+    return 0;
 }
 
 int blm_powered_down(const blm_unit *u)

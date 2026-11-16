@@ -44,6 +44,7 @@ struct blm_session {
     int questions, ready;             /* the setup's: questions asked, "ready" said */
     double cyc_owed, since_save;
     int display_mode;
+    int failed;                      /* do not retry execution or persist a partially failed unit */
 };
 
 static void note(blm_session *s, const char *t)
@@ -81,27 +82,35 @@ static uint8_t dt_status(void *ctx)
 }
 
 /* ---- running ------------------------------------------------------------------------------------------------------- */
-static void run_unheard(blm_session *s, double seconds)
+static int run_unheard(blm_session *s, double seconds, char *err, size_t errlen)
 {
     int16_t junk[256];
     double t;
     for (t = 0; t < seconds; t += SLICE_S) {
         size_t n = (size_t)(SLICE_S * blm_dt_rate(s->dt));
-        blm_run(s->u, (uint64_t)(SLICE_S * blm_clock_hz(s->u)));
+        if (blm_run(s->u, (uint64_t)(SLICE_S * blm_clock_hz(s->u)), err, errlen)) {
+            s->failed = 1;
+            return -1;
+        }
         /* the chip's time goes on with the unit's: the firmware waits on its talking flag */
         blm_dt_render(s->dt, junk, n > 256 ? 256 : n);
     }
+    return 0;
 }
 
-static void switch_off(blm_session *s)
+static int switch_off(blm_session *s, char *err, size_t errlen)
 {
     int i;
-    blm_power(s->u, 0);
-    for (i = 0; i < 400 && !blm_powered_down(s->u); i++) run_unheard(s, SLICE_S);
+    if (blm_power(s->u, 0, err, errlen)) return -1;
+    for (i = 0; i < 400 && !blm_powered_down(s->u); i++)
+        if (run_unheard(s, SLICE_S, err, errlen)) return -1;
+    if (!blm_powered_down(s->u)) { snprintf(err, errlen, "the unit did not switch off"); return -1; }
+    return 0;
 }
 
 static int save_locked(blm_session *s, char *err, size_t errlen)
 {
+    if (s->failed) { snprintf(err, errlen, "the unit stopped after an execution error; memory was not saved"); return -1; }
     if (blm_save(s->u, s->state)) {
         snprintf(err, errlen, "could not save the unit's memory to %s", s->state);
         return -1;
@@ -116,9 +125,11 @@ static int setup_locked(blm_session *s, char *err, size_t errlen)
     blm_host host = {s, dt_write, dt_status};
     double t, answer_at = 0;
     int asked = 0;
+    s->failed = 1;
     if (s->u) blm_destroy(s->u);
-    s->u = blm_create(s->data + s->off, s->n - s->off, &host);
-    if (!s->u) { snprintf(err, errlen, "out of memory"); return -1; }
+    s->u = blm_create(s->data + s->off, s->n - s->off, &host, err, errlen);
+    if (!s->u) return -1;
+    s->failed = 0;
     blm_display_mode_switch(s->u, s->display_mode);
     s->questions = s->ready = 0;
     note(s, "Setting up a new unit: the hard reset, every question answered yes (a few seconds).");
@@ -133,13 +144,12 @@ static int setup_locked(blm_session *s, char *err, size_t errlen)
             answer_at = 0;
             blm_chord(s->u, 0x3D, 0);
         }
-        run_unheard(s, SLICE_S);
+        if (run_unheard(s, SLICE_S, err, errlen)) return -1;
     }
     if (!s->ready) { snprintf(err, errlen, "the new unit's setup did not finish"); return -1; }
-    switch_off(s);
+    if (switch_off(s, err, errlen)) return -1;
     if (save_locked(s, err, errlen)) return -1;
-    blm_power(s->u, 1);               /* on again: the first start a person hears */
-    return 0;
+    return blm_power(s->u, 1, err, errlen); /* on again: the first start a person hears */
 }
 
 blm_session *session_open(session_note_fn fn, void *ctx, char *err, size_t errlen)
@@ -168,8 +178,8 @@ blm_session *session_open(session_note_fn fn, void *ctx, char *err, size_t errle
     host.ctx = s;
     host.dt_write = dt_write;
     host.dt_status = dt_status;
-    s->u = blm_create(s->data + s->off, s->n - s->off, &host);
-    if (!s->u) { snprintf(err, errlen, "out of memory"); goto fail; }
+    s->u = blm_create(s->data + s->off, s->n - s->off, &host, err, errlen);
+    if (!s->u) goto fail;
     if (blm_load(s->u, s->state) && setup_locked(s, err, errlen)) goto fail;
     return s;
 fail:
@@ -186,9 +196,10 @@ void session_close(blm_session *s)
     char err[256];
     if (!s) return;
     LOCK(&s->lock);
-    blm_keys(s->u, 0, 0);
-    switch_off(s);
-    if (save_locked(s, err, sizeof err)) note(s, err);
+    if (s->u) blm_keys(s->u, 0, 0);
+    if (!s->failed) {
+        if (switch_off(s, err, sizeof err) || save_locked(s, err, sizeof err)) note(s, err);
+    }
     UNLOCK(&s->lock);
     blm_destroy(s->u);
     blm_dt_free(s->dt);
@@ -201,9 +212,16 @@ void session_render(blm_session *s, int16_t *out, size_t n, unsigned rate)
 {
     char err[256];
     LOCK(&s->lock);
+    if (s->failed) { memset(out, 0, n * sizeof *out); UNLOCK(&s->lock); return; }
     if (rate && blm_dt_rate(s->dt) != rate) blm_dt_set_rate(s->dt, rate);
     s->cyc_owed += (double)n / blm_dt_rate(s->dt) * blm_clock_hz(s->u);
-    blm_run(s->u, (uint64_t)s->cyc_owed);
+    if (blm_run(s->u, (uint64_t)s->cyc_owed, err, sizeof err)) {
+        s->failed = 1;
+        memset(out, 0, n * sizeof *out);
+        note(s, err);
+        UNLOCK(&s->lock);
+        return;
+    }
     s->cyc_owed -= (double)(uint64_t)s->cyc_owed;
     blm_dt_render(s->dt, out, n);
     s->since_save += (double)n / blm_dt_rate(s->dt);
@@ -215,7 +233,8 @@ void session_run_silent(blm_session *s, double seconds)
 {
     char err[256];
     LOCK(&s->lock);
-    run_unheard(s, seconds);
+    if (s->failed) { UNLOCK(&s->lock); return; }
+    if (run_unheard(s, seconds, err, sizeof err)) { note(s, err); UNLOCK(&s->lock); return; }
     s->since_save += seconds;
     if (s->since_save >= SAVE_EVERY_S && save_locked(s, err, sizeof err)) note(s, err);
     UNLOCK(&s->lock);
@@ -224,23 +243,29 @@ void session_run_silent(blm_session *s, double seconds)
 void session_chord(blm_session *s, int dots, int space)
 {
     LOCK(&s->lock);
-    blm_chord(s->u, dots, space);
+    if (!s->failed) blm_chord(s->u, dots, space);
     UNLOCK(&s->lock);
 }
 
 void session_keys(blm_session *s, int dots, int space)
 {
     LOCK(&s->lock);
-    blm_keys(s->u, dots, space);
+    if (!s->failed) blm_keys(s->u, dots, space);
     UNLOCK(&s->lock);
 }
 
 void session_restart(blm_session *s, int hold_dots, int hold_space)
 {
+    char err[256];
     LOCK(&s->lock);
+    if (s->failed) { UNLOCK(&s->lock); return; }
     blm_keys(s->u, 0, 0);
-    switch_off(s);
-    blm_power(s->u, 1);
+    if (switch_off(s, err, sizeof err) || blm_power(s->u, 1, err, sizeof err)) {
+        s->failed = 1;
+        note(s, err);
+        UNLOCK(&s->lock);
+        return;
+    }
     if (hold_dots || hold_space) blm_keys(s->u, hold_dots, hold_space);
     UNLOCK(&s->lock);
 }
@@ -250,6 +275,7 @@ int session_factory(blm_session *s, char *err, size_t errlen)
     int r;
     LOCK(&s->lock);
     r = setup_locked(s, err, errlen);
+    s->failed = r != 0;
     UNLOCK(&s->lock);
     return r;
 }
@@ -258,7 +284,7 @@ void session_display_mode(blm_session *s, int on)
 {
     LOCK(&s->lock);
     s->display_mode = on != 0;
-    blm_display_mode_switch(s->u, s->display_mode);
+    if (s->u) blm_display_mode_switch(s->u, s->display_mode);
     UNLOCK(&s->lock);
 }
 
@@ -268,8 +294,8 @@ int session_cells(blm_session *s, uint8_t *cells, int cap, unsigned *changes)
 {
     int n;
     LOCK(&s->lock);
-    n = blm_cells(s->u, cells, cap);
-    if (changes) *changes = (unsigned)blm_display_latches(s->u);
+    n = s->u ? blm_cells(s->u, cells, cap) : 0;
+    if (changes) *changes = s->u ? (unsigned)blm_display_latches(s->u) : 0;
     UNLOCK(&s->lock);
     return n;
 }

@@ -21,6 +21,7 @@ OUT=dist/$NAME
 rm -rf "$OUT"
 mkdir -p "$OUT/licenses"
 cp licenses/* "$OUT/licenses/"
+cp "${ZCORE_DIR:-third_party/z-core}/LICENSE-MIT" "$OUT/licenses/z-core-MIT.txt"
 
 case $SYS in
 windows)

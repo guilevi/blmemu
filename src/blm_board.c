@@ -301,6 +301,9 @@ static uint8_t io_read(void *ctx, uint16_t port)
     case 0xF0: case 0xF1: case 0xF2: case 0xF5: case 0xF6:
         v = u->port_f[p & 7];
         break;
+    case 0x84:                         /* bit 1: the battery is low (the timer interrupt, 807h); it isn't */
+        v = 0xFD;
+        break;
     case 0xD0:                         /* read in every delay loop and the key handler: its value is thrown away */
         break;
     default:

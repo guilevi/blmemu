@@ -15,6 +15,8 @@
  *                  voltage; dropping it puts them back to reading.
  *   E0h            a latch, read back, with inputs: bit 1 the program bank, bit 2 the clock's chip select (out);
  *                  bit 6 the power switch, bit 3 the Braille Display Mode switch (in, both active high = on / off).
+ *   84h            an input: bit 1 high = the battery is low (read by the timer interrupt; "battery low" every two
+ *                  minutes while it is high).  Answered with the battery fine.
  *   8Ch            the keyboard controller, a microcontroller that shifts bytes to the Z180: bit 5 low = a byte waits
  *                  (and /INT2), bit 1 the Z180's clock (a bit per rising edge, most significant first), bit 0 the
  *                  data, bit 7 low resets it.  Bytes come in pairs (kind, value): 05h the dot keys down (dot 1 =

@@ -168,7 +168,8 @@ static uint8_t rev8(uint8_t b)
 }
 
 /* ---- memory above the program: the RAM, and the window onto the RAM and the file flash ---------------------------- */
-/* phys (80000h-FFFFFh) -> what answers there: *ram set for the RAM, else *chip and *off for a flash chip; 0 nothing */
+/* phys (80000h-FFFFFh) -> what answers there: 1 with *ram set for the RAM, or *ram NULL and *chip and *off for a
+   flash chip; 2 with *ram on the program flash (read only); 0 nothing */
 static int ext_decode(blm_unit *u, uint32_t a, uint8_t **ram, int *chip, uint32_t *off)
 {
     uint32_t ext;
@@ -176,8 +177,16 @@ static int ext_decode(blm_unit *u, uint32_t a, uint8_t **ram, int *chip, uint32_
     if (a < WIN_BASE)                    /* F2h:F1h:F0h, address bits 8-31 (4 KB steps: F0h's low nibble unused) */
         ext = ((((uint32_t)u->port_f[2] << 16 | (uint32_t)u->port_f[1] << 8 | u->port_f[0]) << 8) & ~0xFFFUL) +
               (a - RAM_BASE);
-    else                                 /* F6h:F5h, address bits 16-31 */
-        ext = (((uint32_t)u->port_f[6] << 8 | u->port_f[5]) << 16) + (a - WIN_BASE);
+    else
+        /* F6h:F5h are address bits 16-31 and the CPU gives bits 0-15, so both halves of the window (E0000h and
+           F0000h) show the same 64 KB.  Found from the Help file: the firmware sets F6h:F5h = 0005h and reads
+           F36F8h on, 1,369 bytes, and its "mini help file", 1,369 bytes, is at 536F8h of the program flash. */
+        ext = (((uint32_t)u->port_f[6] << 8 | u->port_f[5]) << 16) + (a & 0xFFFF);
+    if (ext < ROM_SIZE) {                /* the program flash, as the CPU sees it below 80000h: its messages, read
+                                            through the windows (the Help file's text) */
+        *ram = u->flash + ((u->port_e0 & 0x02) ? ROM_SIZE : 0) + ext;
+        return 2;
+    }
     if ((ext >> 24) == 1) {              /* the RAM: 21 address lines, so it repeats through 01000000h-01FFFFFFh */
         *ram = u->ram + (ext & (RAM_SIZE - 1));
         return 1;
@@ -209,9 +218,10 @@ static uint8_t ext_read(blm_unit *u, uint32_t a)
 static void ext_write(blm_unit *u, uint32_t a, uint8_t v)
 {
     uint8_t *r;
-    int chip = 0;
+    int chip = 0, what;
     uint32_t off = 0;
-    if (!ext_decode(u, a, &r, &chip, &off)) {
+    what = ext_decode(u, a, &r, &chip, &off);
+    if (what != 1) {                     /* nothing there, or the program flash (never written in ordinary use) */
         if (u->tr && (u->tr_what & BLM_TR_UNKNOWN))
             fprintf(u->tr, "MW? %05X <- %02X F6:F5=%02X%02X pc=%05X\n", (unsigned)a, v, u->port_f[6], u->port_f[5],
                     (unsigned)u->last_fetch);
@@ -300,6 +310,12 @@ static uint8_t io_read(void *ctx, uint16_t port)
         break;
     case 0xF0: case 0xF1: case 0xF2: case 0xF5: case 0xF6:
         v = u->port_f[p & 7];
+        break;
+    case 0x84:
+        /* bit 1: the battery is low (the half-second tick at 0807h: IN0 A,(84h), BIT 1,A, and when set a flag at
+           D40Fh that has the unit say "battery low" after 88 s and every 125 s from then on).  A unit on a good
+           battery reads it clear.  The other bits are not read there; left high. */
+        v = 0xFD;
         break;
     case 0xD0:                         /* read in every delay loop and the key handler: its value is thrown away */
         break;
